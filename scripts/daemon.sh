@@ -1,18 +1,19 @@
 #!/bin/bash
-# GitHub Notification Daemon for Repo Maintainer
-# Polls GitHub notifications and creates signal files for main agent
+# Repo Maintainer Daemon - Direct Polling
+# Polls repos for issues/PRs directly instead of using GitHub notifications API
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SKILL_DIR="$(dirname "$SCRIPT_DIR")"
 STATE_DIR="/data/.clawdbot/repo-maintainer"
+STATE_FILE="$STATE_DIR/state.json"
 PID_FILE="$STATE_DIR/daemon.pid"
 LOG_FILE="$STATE_DIR/daemon.log"
 CONFIG_FILE="${REPO_MAINTAINER_CONFIG:-$HOME/.config/repo-maintainer/repos.yaml}"
 
-# Defaults
-POLL_INTERVAL=${POLL_INTERVAL:-60}
+# Default poll interval: 5 minutes (300 seconds)
+POLL_INTERVAL=${POLL_INTERVAL:-300}
 
 mkdir -p "$STATE_DIR"
 
@@ -30,180 +31,193 @@ if [ -z "$BOT_USERNAME" ]; then
     exit 1
 fi
 
-# API helper
-gh_api() {
-    curl -s -H "Authorization: Bearer $GITHUB_TOKEN" -H "Accept: application/vnd.github+json" "$@"
-}
-
 log() {
     echo "[$(date -Iseconds)] $1" >> "$LOG_FILE"
 }
 
-# Get repos from config or auto-detect from GitHub
+# Get repos from config
 get_repos() {
     if [ -f "$CONFIG_FILE" ]; then
-        # Extract repo names from config (lines with "owner/repo:" pattern)
-        grep -oE '[a-zA-Z0-9_-]+/[a-zA-Z0-9_.-]+:' "$CONFIG_FILE" | sed 's/:$//' | tr '\n' ' '
+        grep -oE '[a-zA-Z0-9_-]+/[a-zA-Z0-9_.-]+:' "$CONFIG_FILE" | sed 's/:$//'
     else
-        # Auto-detect: get repos owned by user
-        log "Auto-detecting repos for @$BOT_USERNAME..."
-        gh api "users/$BOT_USERNAME/repos?per_page=100&type=owner" \
-            --jq '.[].full_name' 2>/dev/null | tr '\n' ' '
+        log "ERROR: Config not found at $CONFIG_FILE"
+        return 1
     fi
 }
 
-# Generate default config if missing
-ensure_config() {
-    if [ ! -f "$CONFIG_FILE" ]; then
-        mkdir -p "$(dirname "$CONFIG_FILE")"
-        log "Creating default config at $CONFIG_FILE"
-        
-        # Get repos first
-        local repos
-        repos=$(get_repos)
-        
-        # Build config
-        {
-            echo "# Repo Maintainer Config"
-            echo "# Auto-generated for @$BOT_USERNAME"
-            echo ""
-            echo "repos:"
-            for repo in $repos; do
-                [ -z "$repo" ] && continue
-                cat << REPO
-  $repo:
-    issues:
-      auto_label: true
-      stale_days: 30
-    prs:
-      auto_merge: true
-      require_tests: true
-REPO
-            done
-            echo ""
-            echo "daemon:"
-            echo "  poll_interval: 60"
-        } > "$CONFIG_FILE"
-        
-        local count=$(echo "$repos" | wc -w)
-        log "Config created with $count repos"
+# Initialize state file if missing
+init_state() {
+    if [ ! -f "$STATE_FILE" ]; then
+        echo '{}' > "$STATE_FILE"
     fi
 }
 
-REPOS=$(get_repos)
-
-is_processed() {
-    local id="$1"
-    grep -q "^$id$" "$STATE_DIR/processed-notifications" 2>/dev/null
+# Get current state
+get_state() {
+    cat "$STATE_FILE" 2>/dev/null || echo '{}'
 }
 
-mark_processed() {
-    local id="$1"
-    echo "$id" >> "$STATE_DIR/processed-notifications"
-    tail -1000 "$STATE_DIR/processed-notifications" > "$STATE_DIR/processed.tmp"
-    mv "$STATE_DIR/processed.tmp" "$STATE_DIR/processed-notifications"
+# Update state for a repo
+update_repo_state() {
+    local repo="$1"
+    local type="$2"  # issues or prs
+    local number="$3"
+    local updated_at="$4"
+    local status="$5"
+
+    local state=$(get_state)
+
+    # Use jq to update the state
+    echo "$state" | jq --arg repo "$repo" --arg type "$type" --arg num "$number" \
+        --arg updated "$updated_at" --arg status "$status" '
+        (.[$repo] // {}) as $repo_state |
+        ($repo_state[$type] // {}) as $items |
+        $items[$num] = {updated_at: $updated, status: $status} |
+        $repo_state[$type] = $items |
+        .[$repo] = $repo_state
+    ' > "$STATE_FILE.tmp" && mv "$STATE_FILE.tmp" "$STATE_FILE"
 }
 
-process_notification() {
-    local notif="$1"
-    local id=$(echo "$notif" | jq -r '.id')
-    local reason=$(echo "$notif" | jq -r '.reason')
-    local repo=$(echo "$notif" | jq -r '.repository.full_name')
-    local subject_type=$(echo "$notif" | jq -r '.subject.type')
-    local subject_url=$(echo "$notif" | jq -r '.subject.url')
-    local subject_title=$(echo "$notif" | jq -r '.subject.title')
-    
-    # Skip if not in our repos
-    local in_repos=false
-    for r in $REPOS; do
-        [ "$r" = "$repo" ] && in_repos=true && break
-    done
-    [ "$in_repos" = false ] && return 0
-    
-    log "[$subject_type] $subject_title in $repo"
-    
-    case "$subject_type" in
-        "PullRequest")
-            local pr_data=$(gh_api "$subject_url")
-            local pr_number=$(echo "$pr_data" | jq -r '.number')
-            local pr_user=$(echo "$pr_data" | jq -r '.user.login')
-            local pr_state=$(echo "$pr_data" | jq -r '.state')
-            local pr_url=$(echo "$pr_data" | jq -r '.html_url')
-            
-            if [ "$pr_user" = "$BOT_USERNAME" ] && [ "$pr_state" = "open" ]; then
-                log "  → Pending PR #$pr_number"
-                jq -n \
-                    --arg repo "$repo" \
-                    --argjson number "$pr_number" \
-                    --arg title "$subject_title" \
-                    --arg url "$pr_url" \
-                    '{repo: $repo, number: $number, title: $title, url: $url}' \
-                    > "$STATE_DIR/pending-pr.json"
-            fi
-            ;;
-            
-        "Issue")
-            local issue_data=$(gh_api "$subject_url")
-            local issue_number=$(echo "$issue_data" | jq -r '.number')
-            local issue_user=$(echo "$issue_data" | jq -r '.user.login')
-            local issue_url=$(echo "$issue_data" | jq -r '.html_url')
-            local labels=$(echo "$issue_data" | jq '[.labels[].name]')
-            
-            log "  → Issue #$issue_number by $issue_user"
+# Update last scan time for a repo
+update_last_scan() {
+    local repo="$1"
+    local state=$(get_state)
+
+    echo "$state" | jq --arg repo "$repo" --arg time "$(date -u -Iseconds)" '
+        (.[$repo] // {}) as $repo_state |
+        $repo_state.last_scan = $time |
+        .[$repo] = $repo_state
+    ' > "$STATE_FILE.tmp" && mv "$STATE_FILE.tmp" "$STATE_FILE"
+}
+
+# Check if item needs processing (new or updated since last check)
+needs_processing() {
+    local repo="$1"
+    local type="$2"  # issues or prs
+    local number="$3"
+    local updated_at="$4"
+
+    local state=$(get_state)
+    local last_updated=$(echo "$state" | jq -r --arg repo "$repo" --arg type "$type" --arg num "$number" \
+        '.[$repo][$type][$num].updated_at // empty')
+
+    # If never seen, or updated_at is newer
+    [ -z "$last_updated" ] || [ "$updated_at" ">" "$last_updated" ]
+}
+
+# Process a single repo
+process_repo() {
+    local repo="$1"
+    log "Scanning $repo"
+
+    # Fetch open issues
+    local issues
+    issues=$(gh issue list --repo "$repo" --state open --json number,title,updatedAt,author,labels 2>/dev/null || echo '[]')
+
+    echo "$issues" | jq -r '.[] | @base64' | while read -r issue_b64; do
+        local issue=$(echo "$issue_b64" | base64 -d)
+        local number=$(echo "$issue" | jq -r '.number')
+        local title=$(echo "$issue" | jq -r '.title')
+        local author=$(echo "$issue" | jq -r '.author.login')
+        local labels=$(echo "$issue" | jq '[.labels[].name]')
+        local updated_at=$(echo "$issue" | jq -r '.updatedAt')
+
+        if needs_processing "$repo" "issues" "$number" "$updated_at"; then
+            log "  New/updated issue #$number: $title"
+
+            # Create signal file
             jq -n \
                 --arg repo "$repo" \
-                --argjson number "$issue_number" \
-                --arg title "$subject_title" \
-                --arg author "$issue_user" \
-                --arg url "$issue_url" \
+                --argjson number "$number" \
+                --arg title "$title" \
+                --arg author "$author" \
+                --arg url "https://github.com/$repo/issues/$number" \
                 --argjson labels "$labels" \
-                '{repo: $repo, number: $number, title: $title, author: $author, url: $url, labels: $labels}' \
-                > "$STATE_DIR/pending-issue-$issue_number.json"
-            ;;
-            
-        "PullRequestReview"|"PullRequestReviewComment")
-            log "  → Review activity"
-            touch "$STATE_DIR/pending-review"
-            ;;
-            
-        "IssueComment")
-            # Check if it's on an issue we're tracking
-            log "  → Comment activity"
-            touch "$STATE_DIR/new-activity"
-            ;;
-    esac
-    
-    mark_processed "$id"
+                --arg updated "$updated_at" \
+                '{repo: $repo, number: $number, title: $title, author: $author, url: $url, labels: $labels, updated: $updated}' \
+                > "$STATE_DIR/pending-issue-$number.json"
+
+            # Update state
+            update_repo_state "$repo" "issues" "$number" "$updated_at" "pending"
+        fi
+    done
+
+    # Fetch open PRs
+    local prs
+    prs=$(gh pr list --repo "$repo" --state open --json number,title,updatedAt,author,headRefName 2>/dev/null || echo '[]')
+
+    echo "$prs" | jq -r '.[] | @base64' | while read -r pr_b64; do
+        local pr=$(echo "$pr_b64" | base64 -d)
+        local number=$(echo "$pr" | jq -r '.number')
+        local title=$(echo "$pr" | jq -r '.title')
+        local author=$(echo "$pr" | jq -r '.author.login')
+        local branch=$(echo "$pr" | jq -r '.headRefName')
+        local updated_at=$(echo "$pr" | jq -r '.updatedAt')
+
+        # Only process PRs by bot user
+        if [ "$author" = "$BOT_USERNAME" ]; then
+            if needs_processing "$repo" "prs" "$number" "$updated_at"; then
+                log "  New/updated PR #$number (yours): $title"
+
+                # Create signal file
+                jq -n \
+                    --arg repo "$repo" \
+                    --argjson number "$number" \
+                    --arg title "$title" \
+                    --arg url "https://github.com/$repo/pull/$number" \
+                    --arg branch "$branch" \
+                    '{repo: $repo, number: $number, title: $title, url: $url, branch: $branch}' \
+                    > "$STATE_DIR/pending-pr.json"
+
+                # Update state
+                update_repo_state "$repo" "prs" "$number" "$updated_at" "pending"
+            fi
+        fi
+    done
+
+    update_last_scan "$repo"
 }
 
+# Run a single scan (for manual trigger)
+run_scan() {
+    init_state
+
+    log "=== Starting Scan ==="
+    local repos=$(get_repos)
+
+    if [ -z "$repos" ]; then
+        log "ERROR: No repos configured"
+        return 1
+    fi
+
+    for repo in $repos; do
+        process_repo "$repo"
+    done
+
+    log "=== Scan Complete ==="
+}
+
+# Main daemon loop
 run_daemon() {
-    ensure_config
-    REPOS=$(get_repos)
-    
+    init_state
+
+    local repos=$(get_repos)
+
+    if [ -z "$repos" ]; then
+        log "ERROR: No repos configured"
+        return 1
+    fi
+
     log "=== Daemon Started ==="
     log "User: @$BOT_USERNAME"
     log "Poll interval: ${POLL_INTERVAL}s"
-    log "Repos: $REPOS"
-    
+    log "Repos: $repos"
+
     while true; do
-        local since=$(date -u -d '5 minutes ago' -Iseconds 2>/dev/null || date -u -v-5M -Iseconds)
-        local notifications=$(gh_api "https://api.github.com/notifications?since=$since&per_page=50" | jq -r '.[] | @base64')
-        
-        local count=0
-        while read -r notif_b64; do
-            [ -z "$notif_b64" ] && continue
-            
-            local notif=$(echo "$notif_b64" | base64 -d)
-            local id=$(echo "$notif" | jq -r '.id')
-            
-            is_processed "$id" && continue
-            
-            process_notification "$notif"
-            ((count++))
-        done <<< "$notifications"
-        
-        [ $count -gt 0 ] && log "Processed $count notifications"
-        
+        for repo in $repos; do
+            process_repo "$repo"
+        done
+
         sleep "$POLL_INTERVAL"
     done
 }
@@ -220,7 +234,7 @@ case "${1:-}" in
         echo "Started (PID: $(cat $PID_FILE))"
         echo "Log: $LOG_FILE"
         ;;
-        
+
     stop)
         if [ -f "$PID_FILE" ]; then
             kill $(cat "$PID_FILE") 2>/dev/null || true
@@ -230,25 +244,34 @@ case "${1:-}" in
             echo "Daemon not running"
         fi
         ;;
-        
+
     status)
         if [ -f "$PID_FILE" ] && kill -0 $(cat "$PID_FILE") 2>/dev/null; then
             echo "Running (PID: $(cat $PID_FILE))"
             echo "Log: $LOG_FILE"
             echo ""
+            echo "State:"
+            cat "$STATE_FILE" 2>/dev/null | jq '.' || echo "  (no state yet)"
+            echo ""
             echo "Pending signals:"
-            ls -la "$STATE_DIR"/*.json 2>/dev/null || echo "  (none)"
+            ls -la "$STATE_DIR"/*.json 2>/dev/null | grep -v state.json || echo "  (none)"
         else
             echo "Not running"
         fi
         ;;
-        
+
+    scan)
+        # Manual single scan
+        run_scan
+        echo "Scan complete. Check $STATE_DIR for signal files."
+        ;;
+
     _run)
         run_daemon
         ;;
-        
+
     *)
-        echo "Usage: $0 {start|stop|status}"
+        echo "Usage: $0 {start|stop|status|scan}"
         exit 1
         ;;
 esac
