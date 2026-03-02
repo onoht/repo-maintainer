@@ -9,7 +9,7 @@ Fully autonomous GitHub repository maintenance. No human approval needed.
 
 ## Design Decisions
 
-- **Trigger**: Polling daemon (60s interval)
+- **Trigger**: Direct polling (5 min interval)
 - **Multi-tenant**: Works for any GitHub user
 - **Processing**: One event at a time, sequential
 - **Approval**: None — fully autonomous
@@ -33,8 +33,13 @@ First run creates default config at `~/.config/repo-maintainer/repos.yaml`.
 ## How It Works
 
 ```
-GitHub Notifications → Daemon (60s) → Signal Files → Main Agent → Subagents
+Direct Polling → State Tracking → Signal Files → Main Agent → Subagents
 ```
+
+**Daemon polls repos directly** every 5 minutes:
+- Fetches all open issues/PRs via `gh` CLI
+- Compares `updated_at` against stored state
+- Only creates signals for new/changed items
 
 **Fully autonomous**:
 - Issues auto-labeled and triaged
@@ -102,7 +107,7 @@ repos:
       require_tests: true
 
 daemon:
-  poll_interval: 60
+  poll_interval: 300  # 5 minutes
 ```
 
 To monitor specific repos only:
@@ -131,7 +136,8 @@ The daemon reads your GitHub identity and monitors repos you own/maintain.
 
 | Script | Purpose |
 |--------|---------|
-| `daemon.sh start/stop/status` | Notification poller |
+| `daemon.sh start/stop/status/scan` | Issue/PR poller |
+| `scan-now.sh` | Manual scan (immediate) |
 | `triage.py --repo X --issue N` | Label + prioritize issue |
 | `verify-pr.sh repo pr-number` | Build + test PR |
 
