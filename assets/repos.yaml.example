@@ -1,0 +1,104 @@
+# Example repos.yaml configuration
+# Copy to ~/.config/repo-maintainer/repos.yaml
+
+repos:
+  onoht/flow:
+    issues:
+      enabled: true
+      auto_label: true
+      triage: true
+      stale_days: 30
+    prs:
+      enabled: true
+      auto_merge_owner: true
+      require_tests: true
+
+  onoht/explorations:
+    issues:
+      enabled: true
+      auto_label: false  # Less structured project
+      triage: true
+    prs:
+      enabled: true
+      auto_merge_owner: true
+      require_tests: false  # Static site, no tests
+
+  onoht/blog:
+    issues:
+      enabled: false  # Blog doesn't use GitHub issues
+    prs:
+      enabled: true
+      auto_merge_owner: true
+      require_tests: false
+
+  onoht/onoht:
+    issues:
+      enabled: true
+      auto_label: true
+    prs:
+      enabled: true
+      auto_merge_owner: true
+
+daemon:
+  poll_interval: 60
+  log_level: info
+
+# Default label patterns (can be overridden)
+labels:
+  bug:
+    - "error"
+    - "crash"
+    - "doesn'?t work"
+    - "broken"
+    - "fail"
+    - "\\bbug\\b"
+  enhancement:
+    - "feature"
+    - "add"
+    - "support for"
+    - "would be nice"
+    - "could"
+    - "request"
+  documentation:
+    - "docs?"
+    - "readme"
+    - "example"
+    - "guide"
+  question:
+    - "how"
+    - "what"
+    - "why"
+    - "help"
+    - "question"
+  security:
+    - "security"
+    - "vulnerability"
+    - "cve"
+    - "exploit"
+
+priority:
+  P0:
+    - "security"
+    - "data loss"
+    - "production"
+    - "outage"
+    - "critical"
+    - "urgent"
+  P1:
+    - "regression"
+    - "breaking"
+    - "workaround"
+  P3:
+    - "nice to have"
+    - "someday"
+    - "minor"
+    - "polish"
+
+# Notifications (optional)
+notifications:
+  telegram:
+    enabled: false
+    # channel: "-1002381931352"
+    events:
+      - pr_merged
+      - verification_failed
