@@ -84,9 +84,7 @@ update_last_scan() {
     local state=$(get_state)
 
     echo "$state" | jq --arg repo "$repo" --arg time "$(date -u -Iseconds)" '
-        (.[$repo] // {}) as $repo_state |
-        $repo_state.last_scan = $time |
-        .[$repo] = $repo_state
+        .[$repo].last_scan = $time
     ' > "$STATE_FILE.tmp" && mv "$STATE_FILE.tmp" "$STATE_FILE"
 }
 
